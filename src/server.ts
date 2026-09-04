@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { GoogleGenerativeAI, Content, Part } from "@google/generative-ai";
-import { Redis } from "@upstash/redis";
+import Redis from "ioredis";
 
 /* ============================================================
  * NOVA AI / هوش نوا — فایل یکپارچه (Single-File Build)
@@ -183,18 +183,19 @@ const logger = {
     ),
 };
 
-/* ---------------------------- Database (Upstash Redis) ---------------------------- */
+/* ---------------------------- Database (Railway Redis) ---------------------------- */
 
-const redis = Redis.fromEnv();
+const redis = new Redis(required("REDIS_URL"));
 
 const db = {
   async get<T>(key: string): Promise<T | null> {
-    const val = await redis.get<T>(key);
-    return val ?? null;
+    const val = await redis.get(key);
+    return val ? (JSON.parse(val) as T) : null;
   },
   async set<T>(key: string, value: T, ttlSeconds?: number): Promise<void> {
-    if (ttlSeconds) await redis.set(key, value, { ex: ttlSeconds });
-    else await redis.set(key, value);
+    const str = JSON.stringify(value);
+    if (ttlSeconds) await redis.set(key, str, "EX", ttlSeconds);
+    else await redis.set(key, str);
   },
   async del(key: string): Promise<void> {
     await redis.del(key);
