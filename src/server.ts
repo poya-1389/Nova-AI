@@ -171,16 +171,14 @@ const logger = {
     console.log(JSON.stringify({ level: "info", msg, ...meta, ts: new Date().toISOString() })),
   warn: (msg: string, meta?: Record<string, unknown>) =>
     console.warn(JSON.stringify({ level: "warn", msg, ...meta, ts: new Date().toISOString() })),
-  error: (msg: string, err?: unknown, meta?: Record<string, unknown>) =>
-    console.error(
-      JSON.stringify({
-        level: "error",
-        msg,
-        error: err instanceof Error ? err.message : err,
-        ...meta,
-        ts: new Date().toISOString(),
-      })
-    ),
+  error: (msg: string, err?: unknown, meta?: Record<string, unknown>) => {
+    // خروجی متنی ساده (نه JSON تودرتو) تا در هر پنل لاگی (Railway/Vercel/...) کامل و خوانا نمایش داده شود
+    const errMessage = err instanceof Error ? err.message : String(err ?? "");
+    const errStack = err instanceof Error ? err.stack : undefined;
+    console.error(`[ERROR] ${msg} | detail: ${errMessage}`);
+    if (errStack) console.error(errStack);
+    if (meta) console.error(`[ERROR meta] ${JSON.stringify(meta)}`);
+  },
 };
 
 /* ---------------------------- Database (Railway Redis) ---------------------------- */
