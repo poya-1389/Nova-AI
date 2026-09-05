@@ -146,8 +146,8 @@ const config = {
   },
   gemini: {
     apiKey: required("GEMINI_API_KEY"),
-    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-    summaryModel: process.env.GEMINI_SUMMARY_MODEL || process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    model: process.env.GEMINI_MODEL || "gemini-3.6-flash",
+    summaryModel: process.env.GEMINI_SUMMARY_MODEL || process.env.GEMINI_MODEL || "gemini-3.6-flash",
   },
   identity: {
     nameEn: process.env.BOT_NAME_EN || "NOVA AI",
