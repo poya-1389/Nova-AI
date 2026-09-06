@@ -303,13 +303,20 @@ async function editMessageText(
   text: string,
   replyMarkup?: ReturnType<typeof inlineKeyboard>
 ) {
-  return tgCall("editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text: formatText(text),
-    parse_mode: "HTML",
-    reply_markup: replyMarkup,
-  });
+  try {
+    return await tgCall("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text: formatText(text),
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  } catch (err) {
+    // اگر محتوای جدید دقیقاً همان محتوای فعلی باشد (مثلاً کاربر روی یک دکمه دوبار سریع زده)،
+    // تلگرام خطای بی‌ضرر "message is not modified" می‌دهد که نیازی به گزارش نیست.
+    if (err instanceof Error && /message is not modified/i.test(err.message)) return;
+    throw err;
+  }
 }
 
 async function deleteMessage(chatId: number, messageId: number) {
@@ -330,6 +337,31 @@ async function setMyCommands(commands: Array<{ command: string; description: str
 }
 async function setChatMenuButton() {
   return tgCall("setChatMenuButton", { menu_button: { type: "commands" } });
+}
+
+/**
+ * sendMessageDraft (اضافه‌شده در Bot API 9.3، برای همه‌ی ربات‌ها از نسخه‌ی 9.5):
+ * پیش‌نمایش زنده‌ی متن در حال تولید را در چت خصوصی نشان می‌دهد (دقیقاً مثل جلوه‌ی
+ * تایپ زنده‌ی ChatGPT). این پیش‌نمایش موقتی است (~۳۰ ثانیه) و باید در پایان با یک
+ * sendMessage واقعی جایگزین شود تا در چت باقی بماند. فقط در چت خصوصی کار می‌کند.
+ */
+async function sendMessageDraft(chatId: number, draftId: number, text: string, canStop = true) {
+  try {
+    await tgCall("sendMessageDraft", {
+      chat_id: chatId,
+      draft_id: draftId,
+      text: formatText(text || "…"),
+      parse_mode: "HTML",
+      can_stop: canStop,
+    });
+  } catch { /* Draft اختیاری است؛ شکست آن نباید جریان اصلی را متوقف کند */ }
+}
+
+/** واکنش سریع روی پیام کاربر، برای نشان دادن «دریافت شد» — الهام‌گرفته از ربات‌های حرفه‌ای تلگرام */
+async function reactToMessage(chatId: number, messageId: number, emoji: string) {
+  try {
+    await tgCall("setMessageReaction", { chat_id: chatId, message_id: messageId, reaction: [{ type: "emoji", emoji }] });
+  } catch { /* بی‌اهمیت */ }
 }
 
 async function downloadTelegramFileAsBase64(fileId: string): Promise<{ base64: string; mimeType: string; sizeBytes: number }> {
@@ -414,6 +446,20 @@ function splitMessage(text: string, maxLength = 3900): string[] {
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;
+}
+
+/**
+ * قفل هم‌زمانی: اگر کاربر قبل از تمام‌شدن پردازش قبلی، پیام جدید بفرستد، دو درخواست
+ * هم‌زمان می‌توانند حافظه‌ی Redis را با race condition خراب کنند (ترتیب user/model به‌هم بریزد
+ * و Gemini SDK با خطای "First content should be with role user" متوقف شود). این قفل از آن جلوگیری می‌کند.
+ */
+async function acquireProcessingLock(chatId: number, userId: number): Promise<boolean> {
+  const key = `lock:${chatId}:${userId}`;
+  const res = await redis.set(key, "1", "EX", 90, "NX");
+  return res === "OK";
+}
+async function releaseProcessingLock(chatId: number, userId: number): Promise<void> {
+  await redis.del(`lock:${chatId}:${userId}`);
 }
 
 async function checkRateLimit(userId: number): Promise<{ allowed: boolean }> {
@@ -522,6 +568,23 @@ function turnsToHistory(turns: MemoryTurn[]): Content[] {
   return turns.map((t) => ({ role: t.role === "user" ? "user" : "model", parts: [{ text: t.text }] }));
 }
 
+/**
+ * دفاع در برابر خرابی احتمالی ترتیب نقش‌ها در حافظه (مثلاً به‌خاطر race condition بین
+ * دو درخواست هم‌زمان). Gemini SDK اصرار دارد اولین پیام تاریخچه نقش "user" داشته باشد
+ * و نقش‌ها متناوب باشند؛ این تابع هر داده‌ی ناسالم را قبل از رسیدن به SDK پاک‌سازی می‌کند.
+ */
+function sanitizeHistory(turns: MemoryTurn[]): MemoryTurn[] {
+  let start = 0;
+  while (start < turns.length && turns[start].role !== "user") start++;
+  const trimmed = turns.slice(start);
+  const result: MemoryTurn[] = [];
+  for (const turn of trimmed) {
+    if (result.length > 0 && result[result.length - 1].role === turn.role) continue;
+    result.push(turn);
+  }
+  return result;
+}
+
 async function generateGeminiResponse(params: {
   userText: string;
   media?: MediaInput[];
@@ -541,7 +604,7 @@ async function generateGeminiResponse(params: {
   });
 
   const chat = model.startChat({
-    history: turnsToHistory(history),
+    history: turnsToHistory(sanitizeHistory(history)),
     generationConfig: { temperature: 0.7, topP: 0.95, maxOutputTokens: 4096 },
   });
 
@@ -554,6 +617,55 @@ async function generateGeminiResponse(params: {
   const text = result.response.text();
   if (!text || !text.trim()) return "متأسفم، نتوانستم پاسخ مناسبی تولید کنم. می‌توانید سؤال را واضح‌تر دوباره بپرسید؟";
   return text.trim();
+}
+
+/**
+ * نسخه‌ی استریم پاسخ Gemini — برای نمایش زنده‌ی متن در حال تایپ در چت خصوصی
+ * (مشابه ChatGPT) با استفاده از قابلیت جدید تلگرام sendMessageDraft.
+ */
+async function generateGeminiResponseStreaming(
+  params: {
+    userText: string;
+    media?: MediaInput[];
+    history: MemoryTurn[];
+    memorySummary: string | null;
+    userFirstName?: string;
+    chatType: "private" | "group" | "supergroup" | "channel";
+    role: RoleId;
+    language: string;
+    modelName: string;
+  },
+  onPartial: (accumulatedText: string) => void
+): Promise<string> {
+  const { userText, media, history, memorySummary, userFirstName, chatType, role, language, modelName } = params;
+
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    systemInstruction: buildSystemPrompt({ userFirstName, chatType, memorySummary, role, language }),
+  });
+
+  const chat = model.startChat({
+    history: turnsToHistory(sanitizeHistory(history)),
+    generationConfig: { temperature: 0.7, topP: 0.95, maxOutputTokens: 4096 },
+  });
+
+  const parts: Part[] = [];
+  if (userText && userText.trim()) parts.push({ text: userText });
+  if (media && media.length > 0) for (const m of media) parts.push({ inlineData: { mimeType: m.mimeType, data: m.base64Data } });
+  if (parts.length === 0) parts.push({ text: "کاربر بدون متن، یک پیام خالی ارسال کرده است." });
+
+  const streamResult = await chat.sendMessageStream(parts);
+  let accumulated = "";
+  for await (const chunk of streamResult.stream) {
+    const chunkText = chunk.text();
+    if (chunkText) {
+      accumulated += chunkText;
+      onPartial(accumulated);
+    }
+  }
+  const finalResp = await streamResult.response;
+  const finalText = (finalResp.text() || "").trim() || accumulated.trim();
+  return finalText || "متأسفم، نتوانستم پاسخ مناسبی تولید کنم. می‌توانید سؤال را واضح‌تر دوباره بپرسید؟";
 }
 
 /* ---------------------------- Memory (per-chat + global cross-chat) ---------------------------- */
@@ -848,6 +960,8 @@ ${(Object.keys(MODEL_TIERS) as ModelTierId[]).map((k) => {
   const locked = PLAN_RANK[profile.plan] < PLAN_RANK[m.minPlan] ? " 🔒 (نیاز به ارتقا)" : "";
   return `— **${m.label}**: ${m.desc}${locked}`;
 }).join("\n")}
+
+> اگه بعد از انتخاب یه مدل، پیام «سقف استفاده تمام شده» گرفتی، یعنی نیاز به فعال‌سازی Billing روی حساب Google API صاحب ربات داره — نه محدودیت خود ربات.
 `.trim();
   await sendMessage(message.chat.id, text, { replyMarkup: modelKeyboard(profile.settings.modelTier, profile.plan, profile.settings.language) });
 }
@@ -907,30 +1021,70 @@ async function processAndReply({
     return;
   }
 
-  const loader = startLoadingIndicator(chatId, kind);
+  // جلوگیری از پردازش هم‌زمان چند پیام از یک کاربر (که باعث خرابی ترتیب حافظه می‌شود)
+  const gotLock = await acquireProcessingLock(chatId, userId);
+  if (!gotLock) {
+    await sendMessage(chatId, "⏳ درخواست قبلی‌ات هنوز در حال پردازشه. لطفاً چند لحظه صبر کن تا جوابش بیاد.", { replyToMessageId: message.message_id });
+    return;
+  }
+
+  reactToMessage(chatId, message.message_id, "⚡");
+
   try {
     const { summary, turns } = await getConversationContext(chatId, userId);
     const modelName = MODEL_TIERS[profile.settings.modelTier].gemini;
-    const replyText = await generateGeminiResponse({
+    const baseParams = {
       userText, media, history: turns, memorySummary: summary,
       userFirstName: message.from?.first_name, chatType,
       role: profile.settings.role, language: profile.settings.language, modelName,
-    });
+    };
+
+    // برای چت خصوصی + پیام متنی (بدون رسانه): پاسخ زنده و در حال تایپ (مثل ChatGPT)
+    // با قابلیت جدید تلگرام sendMessageDraft نمایش داده می‌شود.
+    const canStream = chatType === "private" && !media;
+    let replyText: string;
+
+    if (canStream) {
+      const draftId = message.message_id;
+      let lastSent = 0;
+      replyText = await generateGeminiResponseStreaming(baseParams, (partial) => {
+        const now = Date.now();
+        if (now - lastSent > 900) {
+          lastSent = now;
+          sendMessageDraft(chatId, draftId, partial, true);
+        }
+      });
+    } else {
+      const loader = startLoadingIndicator(chatId, kind);
+      try {
+        replyText = await generateGeminiResponse(baseParams);
+      } finally {
+        await loader.stop();
+      }
+    }
 
     await appendTurn(chatId, userId, "user", userText || "[رسانه]");
     await appendTurn(chatId, userId, "model", replyText);
     await incrementRequestCount(userId);
-
-    await loader.stop();
 
     const chunks = splitMessage(replyText);
     for (let i = 0; i < chunks.length; i++) {
       await sendMessage(chatId, chunks[i], { replyToMessageId: i === 0 ? message.message_id : undefined });
     }
   } catch (err) {
-    await loader.stop();
     logger.error("Failed to process AI response", err, { chatId, userId });
-    await sendMessage(chatId, "⚠️ مشکلی در پردازش درخواستت پیش اومد. لطفاً دوباره امتحان کن.", { replyToMessageId: message.message_id });
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (/429|quota/i.test(errMsg)) {
+      await sendMessage(
+        chatId,
+        "⚠️ سقف استفاده‌ی این مدل هوش مصنوعی موقتاً تمام شده (محدودیت طرف گوگل، نه خود ربات). می‌تونی با /model یک مدل دیگه انتخاب کنی یا کمی بعد دوباره امتحان کن.",
+        { replyToMessageId: message.message_id }
+      );
+    } else {
+      await sendMessage(chatId, "⚠️ مشکلی در پردازش درخواستت پیش اومد. لطفاً دوباره امتحان کن.", { replyToMessageId: message.message_id });
+    }
+  } finally {
+    await releaseProcessingLock(chatId, userId);
   }
 }
 
